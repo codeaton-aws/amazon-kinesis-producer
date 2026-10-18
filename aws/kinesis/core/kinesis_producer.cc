@@ -25,6 +25,7 @@
 #include <aws/core/http/Scheme.h>
 #include <aws/kinesis/model/DescribeStreamSummaryRequest.h>
 #include <aws/kinesis/model/RecordDistributionStrategy.h>
+#include <aws/kinesis/KinesisErrors.h>
 #include <aws/kinesis/core/kinesis_producer.h>
 
 #include <system_error>
@@ -196,7 +197,48 @@ void KinesisProducer::create_stream_strategy_manager() {
       timing);
 }
 
-boost::optional<StreamStrategy> KinesisProducer::resolve_stream_strategy(
+namespace {
+
+// Classifies a failed DescribeStreamSummary outcome. Returns false (non-retryable)
+// for client errors that a retry of the identical call cannot fix -- AccessDenied,
+// ResourceNotFound, Validation and other non-throttling 4xx -- and true for
+// throttling, 5xx, and transport/unknown errors where a retry may succeed. This is
+// the Kinesis-47877 fix: without it the blocking first-write discovery retried
+// AccessDenied blocking_max_attempts times (3) with blocking_backoff (1s) between,
+// adding ~2s per stream before records flowed.
+bool is_retryable_dss_error(
+    const Aws::Client::AWSError<Aws::Kinesis::KinesisErrors>& err) {
+  const Aws::String name = err.GetExceptionName();
+  // Throttling is a 4xx but is retryable.
+  if (name.find("Throttl") != Aws::String::npos ||
+      name.find("ProvisionedThroughputExceeded") != Aws::String::npos ||
+      name.find("LimitExceeded") != Aws::String::npos ||
+      name.find("RequestLimitExceeded") != Aws::String::npos ||
+      name.find("SlowDown") != Aws::String::npos) {
+    return true;
+  }
+  // Non-retryable client errors: a retry of the same call will fail the same way.
+  static const char* const kNonRetryable[] = {
+      "AccessDenied", "ResourceNotFound", "Validation", "InvalidArgument",
+      "NotAuthorized", "UnrecognizedClient", "InvalidSignature",
+      "MissingAuthenticationToken", "IncompleteSignature", "InvalidClientTokenId"};
+  for (const char* n : kNonRetryable) {
+    if (name.find(n) != Aws::String::npos) {
+      return false;
+    }
+  }
+  // Fall back to the HTTP status: a non-429 4xx is a client error we must not retry.
+  int code = static_cast<int>(err.GetResponseCode());
+  if (code >= 400 && code < 500 && code != 429) {
+    return false;
+  }
+  // 5xx, 429, transport, or unknown: a retry may help.
+  return true;
+}
+
+}  // namespace
+
+StreamStrategyManager::Resolution KinesisProducer::resolve_stream_strategy(
     const std::string& stream) {
   Aws::Kinesis::Model::DescribeStreamSummaryRequest req;
   req.SetStreamName(stream);
@@ -207,27 +249,31 @@ boost::optional<StreamStrategy> KinesisProducer::resolve_stream_strategy(
 
   auto outcome = kinesis_client_->DescribeStreamSummary(req);
   if (!outcome.IsSuccess()) {
+    const auto& err = outcome.GetError();
+    bool retryable = is_retryable_dss_error(err);
     LOG(warning) << "DescribeStreamSummary failed for stream \"" << stream
-                 << "\": " << outcome.GetError().GetExceptionName() << " - "
-                 << outcome.GetError().GetMessage();
-    return boost::none;
+                 << "\": " << err.GetExceptionName() << " - "
+                 << err.GetMessage()
+                 << (retryable ? " (retryable)" : " (non-retryable)");
+    return {boost::none, retryable};
   }
 
   const auto& summary = outcome.GetResult().GetStreamDescriptionSummary();
   if (!summary.RecordDistributionStrategyHasBeenSet()) {
     // Field absent (older service / not an on-demand stream): treat as
-    // unresolved so the stream stays UNKNOWN rather than guessing.
-    return boost::none;
+    // unresolved so the stream stays UNKNOWN rather than guessing. The call
+    // succeeded, so retrying it immediately is pointless -- do not retry.
+    return {boost::none, false};
   }
 
   switch (summary.GetRecordDistributionStrategy()) {
     case Aws::Kinesis::Model::RecordDistributionStrategy::AUTO:
-      return StreamStrategy::AUTO;
+      return {StreamStrategy::AUTO, true};
     case Aws::Kinesis::Model::RecordDistributionStrategy::USER_PARTITION_KEY:
-      return StreamStrategy::USER_PARTITION_KEY;
+      return {StreamStrategy::USER_PARTITION_KEY, true};
     case Aws::Kinesis::Model::RecordDistributionStrategy::NOT_SET:
     default:
-      return boost::none;
+      return {boost::none, false};
   }
 }
 

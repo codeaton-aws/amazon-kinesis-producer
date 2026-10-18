@@ -205,6 +205,31 @@ BOOST_AUTO_TEST_CASE(NoDefault_RetriesThenSucceeds) {
   BOOST_CHECK_EQUAL(resolver->calls, 2);  // failed once, then succeeded
 }
 
+// Kinesis-47877: a NON-retryable failure (e.g. AccessDenied when the role lacks
+// kinesis:DescribeStreamSummary) must stop blocking discovery after ONE attempt
+// and fall back immediately, instead of burning blocking_max_attempts with
+// backoff (~2s per stream). Background recovery is still scheduled.
+BOOST_AUTO_TEST_CASE(NoDefault_NonRetryableFailure_StopsAfterOneAttempt) {
+  auto executor = std::make_shared<FakeExecutor>();
+  int calls = 0;
+  ChangeRecorder changes;
+
+  StreamStrategyManager mgr(
+      executor, StreamStrategy::UNKNOWN,
+      [&calls](const std::string&) {
+        calls++;
+        return StreamStrategyManager::Resolution(boost::none, false);
+      },
+      [&changes](const std::string& s, StreamStrategy st) { changes(s, st); },
+      fast_timing());
+
+  BOOST_CHECK(mgr.get_or_discover("s") == StreamStrategy::LEGACY_AGGREGATE);
+  BOOST_CHECK(mgr.get_strategy("s") == StreamStrategy::LEGACY_AGGREGATE);
+  BOOST_CHECK_EQUAL(calls, 1);                // no retries on a non-retryable error
+  BOOST_CHECK(!executor->scheduled.empty());  // background recovery still scheduled
+  BOOST_CHECK(changes.changes.empty());       // fallback not reported to Java
+}
+
 // No default: all blocking attempts fail; the stream falls back to
 // LEGACY_AGGREGATE (backward compat: keep aggregating) and a recovery is
 // scheduled. The fallback is NOT reported to Java (no change callback).

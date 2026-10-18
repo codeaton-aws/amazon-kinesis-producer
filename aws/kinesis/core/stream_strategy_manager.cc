@@ -74,30 +74,41 @@ StreamStrategy StreamStrategyManager::get_or_discover(
 
   // Bounded blocking discovery (no default case). Records are held by the caller
   // (the daemon) until this returns.
+  int attempts = 0;
   for (int attempt = 0; attempt < timing_.blocking_max_attempts; attempt++) {
-    auto resolved = resolver_(stream);
-    if (resolved) {
-      auto strategy = apply_resolved(stream, *resolved);
+    attempts = attempt + 1;
+    auto resolution = resolver_(stream);
+    if (resolution.strategy) {
+      auto strategy = apply_resolved(stream, *resolution.strategy);
       // Arm the steady-state drift refresh. Without this, a stream that resolves
       // on its first write (the common no-default path) would never be
       // re-checked, so a later strategy change would go undetected.
       schedule_refresh(stream);
       return strategy;
     }
+    if (!resolution.retryable) {
+      // Non-retryable failure (e.g. AccessDenied because the role lacks
+      // kinesis:DescribeStreamSummary): another attempt cannot succeed, so stop
+      // now instead of holding this stream's records for
+      // blocking_max_attempts x blocking_backoff (~2s). Background recovery
+      // below still re-checks later, in case the permission is granted.
+      break;
+    }
     if (attempt + 1 < timing_.blocking_max_attempts) {
       aws::utils::sleep_for(timing_.blocking_backoff);
     }
   }
 
-  // All blocking attempts failed and the strategy is unknown (no default). Solo
+  // Blocking discovery failed (every attempt, or stopped early on a non-retryable
+  // error) and the strategy is unknown (no default). Solo
   // would silently drop aggregation on a version bump (the pre-AUTO KPL always
   // aggregated) -- typically when the role lacks kinesis:DescribeStreamSummary.
   // Fall back to LEGACY_AGGREGATE: keep aggregating while background recovery
   // discovers the real strategy. No-default case only; an explicit default is
   // seeded up front and never reaches here.
   LOG(warning) << "Could not determine RecordDistributionStrategy for stream \""
-               << stream << "\" after " << timing_.blocking_max_attempts
-               << " attempts (check that the KPL role is granted "
+               << stream << "\" after " << attempts
+               << " attempt(s) (check that the KPL role is granted "
                << "kinesis:DescribeStreamSummary); falling back to aggregation "
                << "for backward compatibility until discovery succeeds.";
   {
@@ -145,12 +156,12 @@ void StreamStrategyManager::record_wrong_shard(const std::string& stream) {
 }
 
 void StreamStrategyManager::refresh_one(const std::string& stream) {
-  auto resolved = resolver_(stream);
-  if (resolved) {
-    apply_resolved(stream, *resolved);
+  auto resolution = resolver_(stream);
+  if (resolution.strategy) {
+    apply_resolved(stream, *resolution.strategy);
   }
-  // On failure, leave the cached strategy as-is; the next scheduled refresh or
-  // recovery attempt will try again.
+  // On failure (retryable or not), leave the cached strategy as-is; the next
+  // scheduled refresh or recovery attempt will try again.
 }
 
 StreamStrategy StreamStrategyManager::apply_resolved(const std::string& stream,
