@@ -101,10 +101,10 @@ class KinesisProducer : boost::noncopyable {
       const aws::kinesis::protobuf::StreamMetadata& metadata);
 
   // Resolver seam for StreamStrategyManager. Calls DescribeStreamSummary and
-  // maps the stream's RecordDistributionStrategy to a StreamStrategy. Returns
-  // boost::none if the call fails or the field is absent, leaving the stream
-  // UNKNOWN (records flow solo, which is safe).
-  boost::optional<StreamStrategy> resolve_stream_strategy(
+  // maps the stream's RecordDistributionStrategy to a StreamStrategy. On failure
+  // returns an unset strategy plus a retryable flag (false for non-retryable 4xx
+  // such as AccessDenied), leaving the stream UNKNOWN (records flow solo, safe).
+  StreamStrategyManager::Resolution resolve_stream_strategy(
       const std::string& stream);
 
   // Sends a StreamStrategyUpdate IPC message to Java reporting a stream's

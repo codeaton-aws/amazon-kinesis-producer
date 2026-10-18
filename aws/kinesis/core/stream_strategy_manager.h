@@ -110,12 +110,31 @@ class StreamStrategyManager : boost::noncopyable {
  public:
   using Timing = StreamStrategyTiming;
 
+  // Outcome of one strategy-resolution attempt (one DescribeStreamSummary call).
+  struct Resolution {
+    Resolution() = default;
+    // Implicit on purpose: a bare optional (the pre-existing resolver contract)
+    // is a retryable outcome, so existing resolvers keep their behavior.
+    Resolution(boost::optional<StreamStrategy> s, bool r = true)  // NOLINT
+        : strategy(s), retryable(r) {}
+
+    // Set when the strategy was resolved.
+    boost::optional<StreamStrategy> strategy;
+    // On failure, whether retrying the SAME call could succeed. False for
+    // client errors a retry cannot fix (AccessDenied, ResourceNotFound,
+    // Validation, other non-throttling 4xx): blocking first-write discovery
+    // then falls back after one attempt instead of waiting out
+    // blocking_max_attempts x blocking_backoff (Kinesis-47877).
+    bool retryable = true;
+  };
+
   // Resolves a stream's strategy, typically by calling DescribeStreamSummary.
-  // Returns the strategy on success, or boost::none on failure (throttle,
-  // error, or the field being unavailable). Must be safe to call from the
-  // executor and from a caller thread.
+  // Returns a Resolution: the strategy on success, or an unset strategy plus a
+  // retryable flag on failure (throttle, error, or the field being
+  // unavailable). Must be safe to call from the executor and from a caller
+  // thread.
   using StrategyResolver =
-      std::function<boost::optional<StreamStrategy>(const std::string&)>;
+      std::function<Resolution(const std::string&)>;
 
   // Invoked when a stream's strategy is first resolved or changes. Wired to send
   // a StreamStrategyUpdate to Java.
